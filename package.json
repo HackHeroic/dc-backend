@@ -1,0 +1,25 @@
+{
+  "name": "death-certificate-backend",
+  "version": "1.0.0",
+  "description": "Backend server for death certificate API polling",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "axios": "^1.6.0",
+    "cheerio": "^1.0.0-rc.12",
+    "axios-cookiejar-support": "^4.0.6",
+    "tough-cookie": "^4.1.3"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  }
+}
+
