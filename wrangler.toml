@@ -8,7 +8,7 @@ enabled = false
 # Durable Objects migrations - required for first-time deployment
 [[migrations]]
 tag = "v1"
-new_classes = ["JobDurableObject"]
+new_sqlite_classes = ["JobDurableObject"]
 
 # Durable Objects for stateful job management
 [[durable_objects.bindings]]
