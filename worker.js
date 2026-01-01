@@ -534,21 +534,28 @@ async function startPollingJob(jobId, verificationNumber, providedToken, dates, 
 
 // Helper functions for KV storage
 async function getJobFromKV(jobId, kvStore) {
-  if (!kvStore) {
-    // Fallback to in-memory if KV not available
-    return activeJobs.get(jobId);
+  // Always check in-memory first (fastest)
+  const memoryJob = activeJobs.get(jobId);
+  if (memoryJob) {
+    return memoryJob;
   }
-  try {
-    const jobData = await kvStore.get(`job:${jobId}`);
-    if (jobData) {
-      return JSON.parse(jobData);
+  
+  // Then check KV if available
+  if (kvStore) {
+    try {
+      const jobData = await kvStore.get(`job:${jobId}`);
+      if (jobData) {
+        const job = JSON.parse(jobData);
+        // Also restore to memory for faster access
+        activeJobs.set(jobId, job);
+        return job;
+      }
+    } catch (error) {
+      console.error('Error reading job from KV:', error);
     }
-    return null;
-  } catch (error) {
-    console.error('Error reading job from KV:', error);
-    // Fallback to in-memory
-    return activeJobs.get(jobId);
   }
+  
+  return null;
 }
 
 async function saveJobToKV(jobId, job, kvStore) {
