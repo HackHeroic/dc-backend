@@ -1,4 +1,4 @@
-name = "death-certificate-backend"
+name = "dc-backend"
 main = "worker.js"
 compatibility_date = "2024-01-01"
 
@@ -9,7 +9,6 @@ enabled = false
 [[durable_objects.bindings]]
 name = "JOB_DO"
 class_name = "JobDurableObject"
-script_name = "death-certificate-backend"
 
 # KV namespace for storing job index (optional - for listing jobs)
 # To enable KV storage:
