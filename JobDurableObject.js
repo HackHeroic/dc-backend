@@ -610,6 +610,11 @@ export class JobDurableObject {
         }
       });
 
+      // Check if response is successful
+      if (!response.ok) {
+        throw new Error(`Failed to fetch page: ${response.status} ${response.statusText}`);
+      }
+
       const setCookieHeader = response.headers.get('Set-Cookie');
       if (setCookieHeader) {
         const newCookies = this.parseCookies(setCookieHeader);
@@ -618,28 +623,77 @@ export class JobDurableObject {
       }
 
       const htmlData = await response.text();
+      
+      // Check if we got HTML content
+      if (!htmlData || htmlData.length === 0) {
+        throw new Error('Received empty response from server');
+      }
+
+      // Check if response is HTML (basic check)
+      if (!htmlData.includes('<html') && !htmlData.includes('<!DOCTYPE')) {
+        console.warn('Response might not be HTML. First 200 chars:', htmlData.substring(0, 200));
+      }
+
       const { document } = parseHTML(htmlData);
 
       let csrfToken = null;
       let extractedVerificationNumber = null;
 
+      // Try multiple methods to find CSRF token
       const metaToken = document.querySelector('meta[name="csrf-token"]')?.getAttribute('content');
       if (metaToken) {
         csrfToken = metaToken;
+        console.log('Found CSRF token in meta tag');
       } else {
         const formToken = document.querySelector('input[name="_token"]')?.getAttribute('value');
         if (formToken) {
           csrfToken = formToken;
+          console.log('Found CSRF token in form input');
         } else {
-          const xsrfCookie = this.cookies['XSRF-TOKEN'];
-          if (xsrfCookie) {
-            csrfToken = xsrfCookie;
+          // Try to find in all meta tags
+          const allMetaTags = document.querySelectorAll('meta');
+          for (const meta of allMetaTags) {
+            const name = meta.getAttribute('name');
+            if (name && (name.toLowerCase().includes('csrf') || name.toLowerCase().includes('token'))) {
+              csrfToken = meta.getAttribute('content');
+              if (csrfToken) {
+                console.log(`Found CSRF token in meta tag: ${name}`);
+                break;
+              }
+            }
+          }
+          
+          // Try to find in all hidden inputs
+          if (!csrfToken) {
+            const allInputs = document.querySelectorAll('input[type="hidden"]');
+            for (const input of allInputs) {
+              const name = input.getAttribute('name');
+              if (name && (name.toLowerCase().includes('csrf') || name.toLowerCase().includes('token') || name === '_token')) {
+                csrfToken = input.getAttribute('value');
+                if (csrfToken) {
+                  console.log(`Found CSRF token in hidden input: ${name}`);
+                  break;
+                }
+              }
+            }
+          }
+          
+          // Fallback: try to get from cookies
+          if (!csrfToken) {
+            const xsrfCookie = this.cookies['XSRF-TOKEN'] || this.cookies['xsrf-token'] || this.cookies['csrf-token'];
+            if (xsrfCookie) {
+              csrfToken = xsrfCookie;
+              console.log('Found CSRF token in cookie');
+            }
           }
         }
       }
 
       if (!csrfToken) {
-        throw new Error('Could not extract CSRF token from page');
+        // Log HTML snippet for debugging
+        const htmlSnippet = htmlData.substring(0, 1000);
+        console.error('HTML snippet (first 1000 chars):', htmlSnippet);
+        throw new Error('Could not extract CSRF token from page. Check console logs for HTML content.');
       }
 
       const captchaElement = document.querySelector('.captcha-number') ||
