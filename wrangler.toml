@@ -1,22 +1,17 @@
-# wrangler.toml
-name = "dc-backend"
+name = "death-certificate-backend"
 main = "worker.js"
 compatibility_date = "2024-01-01"
 
 [observability]
 enabled = false
-head_sampling_rate = 1
-[observability.logs]
-enabled = true
-head_sampling_rate = 1
-persist = true
-invocation_logs = true
-[observability.traces]
-enabled = false
-persist = true
-head_sampling_rate = 1
 
-# KV namespace for storing job state (optional - code will use in-memory fallback if not configured)
+# Durable Objects for stateful job management
+[[durable_objects.bindings]]
+name = "JOB_DO"
+class_name = "JobDurableObject"
+script_name = "death-certificate-backend"
+
+# KV namespace for storing job index (optional - for listing jobs)
 # To enable KV storage:
 # 1. Create namespace: wrangler kv:namespace create "JOBS_STORE"
 # 2. Create preview: wrangler kv:namespace create "JOBS_STORE" --preview
