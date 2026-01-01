@@ -2,6 +2,19 @@ name = "death-certificate-backend"
 main = "worker.js"
 compatibility_date = "2024-01-01"
 
+[observability]
+enabled = false
+
+# KV namespace for storing job state (optional - code will use in-memory fallback if not configured)
+# To enable KV storage:
+# 1. Create namespace: wrangler kv:namespace create "JOBS_STORE"
+# 2. Create preview: wrangler kv:namespace create "JOBS_STORE" --preview
+# 3. Uncomment and update the IDs below:
+# [[kv_namespaces]]
+# binding = "JOBS_STORE"
+# id = "your_namespace_id_here"
+# preview_id = "your_preview_namespace_id_here"
+
 [env.production]
 routes = []
 

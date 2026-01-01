@@ -307,8 +307,8 @@ async function pollForDate(jobId, verificationNumber, csrfToken, date, gender) {
 }
 
 // Main polling function
-async function startPollingJob(jobId, verificationNumber, providedToken, dates, gender, searchName, intervalMinutes) {
-  const job = activeJobs.get(jobId);
+async function startPollingJob(jobId, verificationNumber, providedToken, dates, gender, searchName, intervalMinutes, kvStore = null) {
+  const job = await getJobFromKV(jobId, kvStore);
   if (!job) return;
 
   const pollInterval = intervalMinutes * 60 * 1000;
@@ -318,6 +318,7 @@ async function startPollingJob(jobId, verificationNumber, providedToken, dates, 
   try {
     job.status = 'initializing';
     job.lastUpdate = new Date().toISOString();
+    await saveJobToKV(jobId, job, kvStore);
     
     console.log(`Initializing session for job ${jobId}...`);
     const sessionData = await initializeSession(jobId, verificationNumber);
@@ -342,6 +343,7 @@ async function startPollingJob(jobId, verificationNumber, providedToken, dates, 
     
     console.log(`Session initialized. Ready to start polling for job ${jobId}`);
     job.status = 'running';
+    await saveJobToKV(jobId, job, kvStore);
   } catch (error) {
     job.status = 'error';
     job.errors.push({
@@ -349,24 +351,30 @@ async function startPollingJob(jobId, verificationNumber, providedToken, dates, 
       error: `Failed to initialize session: ${error.message}`,
       timestamp: new Date().toISOString()
     });
+    await saveJobToKV(jobId, job, kvStore);
     console.error(`Failed to initialize session for job ${jobId}:`, error);
     return;
   }
 
   async function runPollCycle() {
-    if (!activeJobs.has(jobId)) return;
+    const currentJob = await getJobFromKV(jobId, kvStore);
+    if (!currentJob) return;
 
-    job.status = 'running';
-    job.lastUpdate = new Date().toISOString();
+    currentJob.status = 'running';
+    currentJob.lastUpdate = new Date().toISOString();
+    await saveJobToKV(jobId, currentJob, kvStore);
 
     for (const date of dates) {
-      if (!activeJobs.has(jobId)) break;
+      const currentJob = await getJobFromKV(jobId, kvStore);
+      if (!currentJob) break;
 
       const result = await pollForDate(jobId, finalVerificationNumber, csrfToken, date, gender);
-      job.totalRequests++;
+      currentJob.totalRequests++;
 
       if (result.success) {
         const records = parseCertificateData(result.data);
+        const currentJob = await getJobFromKV(jobId, kvStore);
+        if (!currentJob) continue;
         
         if (searchName) {
           const matchingRecords = records.map(record => {
@@ -408,32 +416,34 @@ async function startPollingJob(jobId, verificationNumber, providedToken, dates, 
               totalRecordsOnDate: records.length
             };
             
-            const existingIndex = job.foundDates.findIndex(f => f.date === date);
+            const existingIndex = currentJob.foundDates.findIndex(f => f.date === date);
             if (existingIndex >= 0) {
-              const existing = job.foundDates[existingIndex];
+              const existing = currentJob.foundDates[existingIndex];
               const mergedRecords = [...existing.records, ...matchingRecords];
               const uniqueRecords = mergedRecords.filter((record, index, self) =>
                 index === self.findIndex(r => r.name === record.name && r.date === record.date)
               );
-              job.foundDates[existingIndex] = {
+              currentJob.foundDates[existingIndex] = {
                 ...foundEntry,
                 records: uniqueRecords
               };
             } else {
-              job.foundDates.push(foundEntry);
+              currentJob.foundDates.push(foundEntry);
             }
             
+            await saveJobToKV(jobId, currentJob, kvStore);
             console.log(`Found ${matchingRecords.length} matching record(s) for "${searchName}" on date ${date}`);
           }
         } else {
           records.forEach(record => {
             record.date = date;
-            job.allRecords.push(record);
+            currentJob.allRecords.push(record);
           });
           
-          if (job.allRecords.length > 1000) {
-            job.allRecords = job.allRecords.slice(-1000);
+          if (currentJob.allRecords.length > 1000) {
+            currentJob.allRecords = currentJob.allRecords.slice(-1000);
           }
+          await saveJobToKV(jobId, currentJob, kvStore);
         }
       } else {
         if (result.needsReinit || (result.error && result.error.includes('419'))) {
@@ -448,69 +458,175 @@ async function startPollingJob(jobId, verificationNumber, providedToken, dates, 
             
             console.log(`Session reinitialized for job ${jobId}`);
             const retryResult = await pollForDate(jobId, finalVerificationNumber, csrfToken, date, gender);
-            job.totalRequests++;
-            
-            if (retryResult.success) {
-              const records = parseCertificateData(retryResult.data);
-              records.forEach(record => {
-                record.date = date;
-                job.allRecords.push(record);
-              });
+            const retryJob = await getJobFromKV(jobId, kvStore);
+            if (retryJob) {
+              retryJob.totalRequests++;
               
-              if (searchName) {
-                const matchingRecords = records.map(record => {
-                  const nameMatch = nameMatches(searchName, record.name);
-                  const fatherMatch = nameMatches(searchName, record.fathersName);
-                  const motherMatch = nameMatches(searchName, record.mothersName);
-                  const matches = [nameMatch, fatherMatch, motherMatch].filter(m => m.match);
-                  if (matches.length === 0) return null;
-                  const bestMatch = matches.reduce((best, current) => 
-                    current.score > best.score ? current : best
-                  );
-                  return {
-                    ...record,
-                    matchScore: bestMatch.score,
-                    matchedField: nameMatch.match ? 'name' : (fatherMatch.match ? 'fathersName' : 'mothersName'),
-                    matchedPart: bestMatch.matchedPart
-                  };
-                }).filter(record => record !== null && record.matchScore >= 60);
+              if (retryResult.success) {
+                const records = parseCertificateData(retryResult.data);
+                records.forEach(record => {
+                  record.date = date;
+                  retryJob.allRecords.push(record);
+                });
                 
-                if (matchingRecords.length > 0) {
-                  matchingRecords.forEach(record => {
-                    record.date = date;
-                  });
-                  const foundEntry = { date, records: matchingRecords };
-                  const existingIndex = job.foundDates.findIndex(f => f.date === date);
-                  if (existingIndex >= 0) {
-                    job.foundDates[existingIndex] = foundEntry;
-                  } else {
-                    job.foundDates.push(foundEntry);
+                if (searchName) {
+                  const matchingRecords = records.map(record => {
+                    const nameMatch = nameMatches(searchName, record.name);
+                    const fatherMatch = nameMatches(searchName, record.fathersName);
+                    const motherMatch = nameMatches(searchName, record.mothersName);
+                    const matches = [nameMatch, fatherMatch, motherMatch].filter(m => m.match);
+                    if (matches.length === 0) return null;
+                    const bestMatch = matches.reduce((best, current) => 
+                      current.score > best.score ? current : best
+                    );
+                    return {
+                      ...record,
+                      matchScore: bestMatch.score,
+                      matchedField: nameMatch.match ? 'name' : (fatherMatch.match ? 'fathersName' : 'mothersName'),
+                      matchedPart: bestMatch.matchedPart
+                    };
+                  }).filter(record => record !== null && record.matchScore >= 60);
+                  
+                  if (matchingRecords.length > 0) {
+                    matchingRecords.forEach(record => {
+                      record.date = date;
+                    });
+                    const foundEntry = { date, records: matchingRecords };
+                    const existingIndex = retryJob.foundDates.findIndex(f => f.date === date);
+                    if (existingIndex >= 0) {
+                      retryJob.foundDates[existingIndex] = foundEntry;
+                    } else {
+                      retryJob.foundDates.push(foundEntry);
+                    }
                   }
                 }
+                await saveJobToKV(jobId, retryJob, kvStore);
+                continue;
               }
-              continue;
             }
           } catch (reinitError) {
             console.error(`Failed to reinitialize session for job ${jobId}:`, reinitError);
           }
         }
         
-        job.errors.push({
-          date,
-          error: result.error,
-          timestamp: new Date().toISOString()
-        });
+        const errorJob = await getJobFromKV(jobId, kvStore);
+        if (errorJob) {
+          errorJob.errors.push({
+            date,
+            error: result.error,
+            timestamp: new Date().toISOString()
+          });
+          await saveJobToKV(jobId, errorJob, kvStore);
+        }
       }
 
       await new Promise(resolve => setTimeout(resolve, 1000));
     }
 
-    if (activeJobs.has(jobId)) {
+    const checkJob = await getJobFromKV(jobId, kvStore);
+    if (checkJob && checkJob.status !== 'stopped') {
       setTimeout(runPollCycle, pollInterval);
     }
   }
 
   runPollCycle();
+}
+
+// Helper functions for KV storage
+async function getJobFromKV(jobId, kvStore) {
+  if (!kvStore) {
+    // Fallback to in-memory if KV not available
+    return activeJobs.get(jobId);
+  }
+  try {
+    const jobData = await kvStore.get(`job:${jobId}`);
+    if (jobData) {
+      return JSON.parse(jobData);
+    }
+    return null;
+  } catch (error) {
+    console.error('Error reading job from KV:', error);
+    // Fallback to in-memory
+    return activeJobs.get(jobId);
+  }
+}
+
+async function saveJobToKV(jobId, job, kvStore) {
+  // Also keep in memory for fast access
+  activeJobs.set(jobId, job);
+  
+  if (kvStore) {
+    try {
+      await kvStore.put(`job:${jobId}`, JSON.stringify(job));
+    } catch (error) {
+      console.error('Error saving job to KV:', error);
+    }
+  }
+}
+
+async function deleteJobFromKV(jobId, kvStore) {
+  activeJobs.delete(jobId);
+  jobCookies.delete(jobId);
+  
+  if (kvStore) {
+    try {
+      await kvStore.delete(`job:${jobId}`);
+    } catch (error) {
+      console.error('Error deleting job from KV:', error);
+    }
+  }
+}
+
+async function getAllJobsFromKV(kvStore) {
+  if (!kvStore) {
+    // Fallback to in-memory
+    return Array.from(activeJobs.entries());
+  }
+  try {
+    // KV doesn't support list operations directly, so we'll use in-memory as primary
+    // and sync from KV when needed. For now, we'll use a jobs index.
+    const jobsIndex = await kvStore.get('jobs:index');
+    const jobIds = jobsIndex ? JSON.parse(jobsIndex) : [];
+    const jobs = [];
+    
+    for (const jobId of jobIds) {
+      const job = await getJobFromKV(jobId, kvStore);
+      if (job) {
+        jobs.push([jobId, job]);
+      }
+    }
+    
+    return jobs;
+  } catch (error) {
+    console.error('Error reading jobs from KV:', error);
+    return Array.from(activeJobs.entries());
+  }
+}
+
+async function addJobToIndex(jobId, kvStore) {
+  if (!kvStore) return;
+  try {
+    const jobsIndex = await kvStore.get('jobs:index');
+    const jobIds = jobsIndex ? JSON.parse(jobsIndex) : [];
+    if (!jobIds.includes(jobId)) {
+      jobIds.push(jobId);
+      await kvStore.put('jobs:index', JSON.stringify(jobIds));
+    }
+  } catch (error) {
+    console.error('Error updating jobs index:', error);
+  }
+}
+
+async function removeJobFromIndex(jobId, kvStore) {
+  if (!kvStore) return;
+  try {
+    const jobsIndex = await kvStore.get('jobs:index');
+    const jobIds = jobsIndex ? JSON.parse(jobsIndex) : [];
+    const filtered = jobIds.filter(id => id !== jobId);
+    await kvStore.put('jobs:index', JSON.stringify(filtered));
+  } catch (error) {
+    console.error('Error updating jobs index:', error);
+  }
 }
 
 // CORS headers helper
@@ -528,6 +644,7 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
     const method = request.method;
+    const kvStore = env.JOBS_STORE; // KV namespace from wrangler.toml
 
     // Handle CORS preflight
     if (method === 'OPTIONS') {
@@ -584,9 +701,12 @@ export default {
           errors: []
         };
 
-        activeJobs.set(jobId, results);
+        // Save to both memory and KV
+        await saveJobToKV(jobId, results, kvStore);
+        await addJobToIndex(jobId, kvStore);
 
-        startPollingJob(jobId, verificationNumber, token, dates, gender, searchName, intervalMinutes);
+        // Start polling job (will update KV as it progresses)
+        startPollingJob(jobId, verificationNumber, token, dates, gender, searchName, intervalMinutes, kvStore);
 
         return new Response(JSON.stringify({ 
           jobId, 
@@ -606,8 +726,14 @@ export default {
 
     // Get job status
     if (path.startsWith('/api/job/') && method === 'GET') {
-      const jobId = path.split('/api/job/')[1];
-      const job = activeJobs.get(jobId);
+      const jobId = path.split('/api/job/')[1]?.split('?')[0]?.split('/')[0];
+      if (!jobId) {
+        return new Response(JSON.stringify({ error: 'Job ID is required' }), {
+          status: 400,
+          headers: { ...corsHeaders(), 'Content-Type': 'application/json' }
+        });
+      }
+      const job = await getJobFromKV(jobId, kvStore);
       
       if (!job) {
         return new Response(JSON.stringify({ error: 'Job not found' }), {
@@ -623,13 +749,20 @@ export default {
 
     // Stop polling
     if (path.startsWith('/api/job/') && method === 'DELETE') {
-      const jobId = path.split('/api/job/')[1];
+      const jobId = path.split('/api/job/')[1]?.split('?')[0]?.split('/')[0];
+      if (!jobId) {
+        return new Response(JSON.stringify({ error: 'Job ID is required' }), {
+          status: 400,
+          headers: { ...corsHeaders(), 'Content-Type': 'application/json' }
+        });
+      }
       
-      if (activeJobs.has(jobId)) {
-        const job = activeJobs.get(jobId);
+      const job = await getJobFromKV(jobId, kvStore);
+      if (job) {
         job.status = 'stopped';
-        activeJobs.delete(jobId);
-        jobCookies.delete(jobId);
+        await saveJobToKV(jobId, job, kvStore);
+        await deleteJobFromKV(jobId, kvStore);
+        await removeJobFromIndex(jobId, kvStore);
         return new Response(JSON.stringify({ message: 'Job stopped', jobId }), {
           headers: { ...corsHeaders(), 'Content-Type': 'application/json' }
         });
@@ -643,7 +776,8 @@ export default {
 
     // List all jobs
     if (path === '/api/jobs' && method === 'GET') {
-      const jobs = Array.from(activeJobs.entries()).map(([jobId, job]) => ({
+      const jobs = await getAllJobsFromKV(kvStore);
+      const jobsList = jobs.map(([jobId, job]) => ({
         jobId,
         searchName: job.searchName,
         status: job.status,
@@ -653,7 +787,7 @@ export default {
         totalRequests: job.totalRequests
       }));
       
-      return new Response(JSON.stringify({ jobs }), {
+      return new Response(JSON.stringify({ jobs: jobsList }), {
         headers: { ...corsHeaders(), 'Content-Type': 'application/json' }
       });
     }
