@@ -5,6 +5,11 @@ compatibility_date = "2024-01-01"
 [observability]
 enabled = false
 
+# Durable Objects migrations - required for first-time deployment
+[[migrations]]
+tag = "v1"
+new_classes = ["JobDurableObject"]
+
 # Durable Objects for stateful job management
 [[durable_objects.bindings]]
 name = "JOB_DO"
