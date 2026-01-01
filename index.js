@@ -87,22 +87,22 @@ function nameMatches(searchName, recordName) {
     return { match: true, score: 100, matchedPart: recordName };
   }
   
-  // For non-exact matches, require the main name part (longest word) to match
-  // This prevents single-letter matches like "D" matching "D LAKSHMI" when searching for "D.KOWSALYA"
+  // For non-exact matches, check if main name part matches
+  // This allows "kowsalya" to match "D.KOWSALYA" because main part "kowsalya" matches
   const searchParts = normalizedSearch.split(/[\s.]+/).filter(w => w.length > 0);
   const recordParts = normalizedRecord.split(/[\s.]+/).filter(w => w.length > 0);
   
-  // Find the longest part in search (this is usually the main name)
+  // Find the longest part in search (this is usually the main name like "KOWSALYA")
   const longestSearchPart = searchParts.reduce((longest, part) => 
     part.length > longest.length ? part : longest, '');
   
-  // The longest search part must be at least 4 characters to avoid single-letter matches
-  if (longestSearchPart.length < 4) {
-    // If search is too short, require exact match
+  // The longest search part must be at least 3 characters to avoid single-letter matches
+  if (longestSearchPart.length < 3) {
     return { match: false, score: 0, matchedPart: '' };
   }
   
-  // Check if the longest search part is contained in any record part
+  // Check if the main name part (longest search part) matches any record part
+  // This allows "kowsalya" to match "D.KOWSALYA" because "kowsalya" matches "kowsalya" in the record
   const hasMainMatch = recordParts.some(recordPart => 
     recordPart.includes(longestSearchPart) || longestSearchPart.includes(recordPart)
   );
@@ -111,26 +111,32 @@ function nameMatches(searchName, recordName) {
     return { match: false, score: 0, matchedPart: '' };
   }
   
-  // If main part matches, check if search name is contained in record name
+  // If main part matches, calculate score
+  // Case 1: Search is contained in record (e.g., "kowsalya" in "dkowsalya")
   if (normalizedRecord.includes(normalizedSearch)) {
-    // Calculate score based on how much of the record name matches
-    const score = (normalizedSearch.length / normalizedRecord.length) * 100;
-    // Only return high scores (85+) for substantial matches
-    if (score >= 85) {
-      return { match: true, score: Math.min(score, 99), matchedPart: recordName };
+    const score = Math.min(100, (normalizedSearch.length / normalizedRecord.length) * 100);
+    // Main part matched, so this is valid - return if score is reasonable
+    if (score >= 50) {
+      return { match: true, score: Math.min(score, 100), matchedPart: recordName };
     }
   }
   
-  // If main part matches but not full string, check word-by-word
-  // But require at least 70% of search length to match
-  const matchedLength = recordParts
-    .filter(rp => searchParts.some(sp => rp.includes(sp) || sp.includes(rp)))
-    .reduce((sum, rp) => sum + rp.length, 0);
-  
-  const matchRatio = matchedLength / normalizedSearch.length;
-  if (matchRatio >= 0.7) {
-    const score = Math.min(99, matchRatio * 100);
-    return { match: true, score, matchedPart: recordName };
+  // Case 2: Main part matches but search is not fully contained
+  // This handles cases like searching "kowsalya" matching "D.KOWSALYA"
+  if (longestSearchPart.length >= 4) {
+    // Main name part is substantial, so if it matches, return a good score
+    const mainPartMatchLength = recordParts
+      .filter(rp => rp.includes(longestSearchPart) || longestSearchPart.includes(rp))
+      .reduce((max, rp) => Math.max(max, rp.length), 0);
+    
+    if (mainPartMatchLength >= longestSearchPart.length) {
+      // Calculate score based on how much of the main part matches
+      const score = Math.min(100, (longestSearchPart.length / Math.max(normalizedRecord.length, longestSearchPart.length)) * 100);
+      // Main part is substantial (at least 4 chars) and matches well
+      if (score >= 60) {
+        return { match: true, score: Math.min(score, 100), matchedPart: recordName };
+      }
+    }
   }
   
   return { match: false, score: 0, matchedPart: '' };
@@ -461,11 +467,12 @@ async function startPollingJob(jobId, verificationNumber, providedToken, dates, 
           }).filter(record => record !== null)
           // Sort by match score (highest first)
           .sort((a, b) => b.matchScore - a.matchScore)
-          // Only show 100% exact matches for precision
+          // Show matches with score >= 60 (allows main name part matches)
+          // This allows "kowsalya" to match "D.KOWSALYA" when main part matches
           .filter(record => {
-            const passes = record.matchScore === 100;
+            const passes = record.matchScore >= 60;
             if (!passes) {
-              console.log(`Filtered out non-exact match: ${record.name} (score: ${record.matchScore})`);
+              console.log(`Filtered out low-score match: ${record.name} (score: ${record.matchScore})`);
             }
             return passes;
           });
