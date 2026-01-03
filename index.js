@@ -116,7 +116,7 @@ function nameMatches(searchName, recordName) {
   if (normalizedRecord.includes(normalizedSearch)) {
     const score = Math.min(100, (normalizedSearch.length / normalizedRecord.length) * 100);
     // Main part matched, so this is valid - return if score is reasonable
-    if (score >= 50) {
+    if (score >= 30) {
       return { match: true, score: Math.min(score, 100), matchedPart: recordName };
     }
   }
@@ -133,7 +133,7 @@ function nameMatches(searchName, recordName) {
       // Calculate score based on how much of the main part matches
       const score = Math.min(100, (longestSearchPart.length / Math.max(normalizedRecord.length, longestSearchPart.length)) * 100);
       // Main part is substantial (at least 4 chars) and matches well
-      if (score >= 60) {
+      if (score >= 30) {
         return { match: true, score: Math.min(score, 100), matchedPart: recordName };
       }
     }
@@ -252,9 +252,15 @@ app.post('/api/start-polling', async (req, res) => {
       startDate, 
       endDate, 
       gender = 'male',
-      searchName,
+      searchName, // Keep for backward compatibility
+      searchNames, // New: array of search names
       intervalMinutes = 60 
     } = req.body;
+    
+    // Normalize search names: use searchNames if provided, otherwise use searchName as array
+    const normalizedSearchNames = searchNames && Array.isArray(searchNames) && searchNames.length > 0
+      ? searchNames.filter(name => name && name.trim() !== '')
+      : (searchName ? [searchName] : []);
 
     if (!startDate || !endDate) {
       return res.status(400).json({ 
@@ -276,20 +282,23 @@ app.post('/api/start-polling', async (req, res) => {
     
     const results = {
       jobId,
-      searchName: searchName || null,
+      searchName: normalizedSearchNames.length > 0 ? normalizedSearchNames[0] : null, // Keep for backward compatibility
+      searchNames: normalizedSearchNames.length > 0 ? normalizedSearchNames : null, // New: array of names
       foundDates: [],
       allRecords: [],
       status: 'initializing',
       startTime: new Date().toISOString(),
       lastUpdate: null,
       totalRequests: 0,
-      errors: []
+      errors: [],
+      errorDates: [], // Track dates that had errors for retry
+      retryingErrors: false // Flag to indicate if currently retrying error dates
     };
 
     activeJobs.set(jobId, results);
 
     // Start polling in background (will initialize session automatically)
-    startPollingJob(jobId, verificationNumber, token, dates, gender, searchName, intervalMinutes);
+    startPollingJob(jobId, verificationNumber, token, dates, gender, normalizedSearchNames, intervalMinutes);
 
     res.json({ 
       jobId, 
@@ -335,25 +344,76 @@ async function pollForDate(jobId, verificationNumber, csrfToken, date, gender) {
           'Accept': 'application/json, text/javascript, */*; q=0.01',
           'Accept-Language': 'en-US,en;q=0.9',
           'X-Requested-With': 'XMLHttpRequest',
-              'Referer': 'http://27.100.26.138/death-certificate'
+          'Referer': 'http://27.100.26.138/death-certificate'
         },
-        timeout: 30000
+        timeout: 30000,
+        validateStatus: function (status) {
+          // Accept all status codes to handle errors gracefully
+          return status >= 200 && status < 500;
+        }
       }
     );
 
-    if (response.data && response.data.status && response.data.data) {
-      return {
-        success: true,
-        data: response.data.data,
-        date
-      };
-    } else {
+    // Log response for debugging
+    console.log(`[${date}] Response status: ${response.status}, Data type: ${typeof response.data}`);
+
+    // Check if response is HTML (error page)
+    if (typeof response.data === 'string' && (response.data.includes('<!DOCTYPE') || response.data.includes('<html'))) {
+      console.error(`[${date}] Received HTML instead of JSON. Possible error page.`);
       return {
         success: false,
-        error: 'Invalid response format',
+        error: 'Server returned HTML error page',
         date
       };
     }
+
+    // Handle different response formats
+    if (response.data) {
+      // Standard success response
+      if (response.data.status && response.data.data) {
+        return {
+          success: true,
+          data: response.data.data,
+          date
+        };
+      }
+      
+      // Response with status but no data (empty results)
+      if (response.data.status === true || response.data.status === 'success') {
+        return {
+          success: true,
+          data: '', // Empty HTML means no records
+          date
+        };
+      }
+      
+      // Response with false status
+      if (response.data.status === false) {
+        return {
+          success: true,
+          data: '', // No records for this date
+          date
+        };
+      }
+      
+      // If data exists but no status field
+      if (response.data.data) {
+        return {
+          success: true,
+          data: response.data.data,
+          date
+        };
+      }
+      
+      // Log unexpected format
+      console.error(`[${date}] Unexpected response format:`, JSON.stringify(response.data).substring(0, 200));
+    }
+
+    return {
+      success: false,
+      error: `Invalid response format: ${JSON.stringify(response.data).substring(0, 100)}`,
+      date
+    };
   } catch (error) {
     // Check if it's a 419 error (CSRF token expired)
     if (error.response && error.response.status === 419) {
@@ -364,6 +424,16 @@ async function pollForDate(jobId, verificationNumber, csrfToken, date, gender) {
         needsReinit: true
       };
     }
+    
+    // Log the actual error for debugging
+    console.error(`[${date}] Request error:`, error.message);
+    if (error.response) {
+      console.error(`[${date}] Response status: ${error.response.status}`);
+      console.error(`[${date}] Response data:`, typeof error.response.data === 'string' 
+        ? error.response.data.substring(0, 200) 
+        : JSON.stringify(error.response.data).substring(0, 200));
+    }
+    
     return {
       success: false,
       error: error.message || 'Request failed',
@@ -373,7 +443,7 @@ async function pollForDate(jobId, verificationNumber, csrfToken, date, gender) {
 }
 
 // Main polling function
-async function startPollingJob(jobId, verificationNumber, providedToken, dates, gender, searchName, intervalMinutes) {
+async function startPollingJob(jobId, verificationNumber, providedToken, dates, gender, searchNames, intervalMinutes) {
   const job = activeJobs.get(jobId);
   if (!job) return;
 
@@ -429,9 +499,11 @@ async function startPollingJob(jobId, verificationNumber, providedToken, dates, 
 
     job.status = 'running';
     job.lastUpdate = new Date().toISOString();
+    job.retryingErrors = false; // Reset retry flag
 
     // Check if we need to reinitialize session (if token expired)
     let needsReinit = false;
+    const errorDatesToRetry = []; // Track dates that fail in this cycle
 
     for (const date of dates) {
       if (!activeJobs.has(jobId)) break; // Check if job still exists
@@ -441,36 +513,58 @@ async function startPollingJob(jobId, verificationNumber, providedToken, dates, 
 
       if (result.success) {
         needsReinit = false; // Reset flag on success
+        // Remove from error dates if it was there
+        job.errorDates = job.errorDates.filter(d => d !== date);
         const records = parseCertificateData(result.data);
         
-        // Check for search name if provided
-        if (searchName) {
+        // Check for search names if provided
+        if (searchNames && searchNames.length > 0) {
           const matchingRecords = records.map(record => {
-            const nameMatch = nameMatches(searchName, record.name);
-            const fatherMatch = nameMatches(searchName, record.fathersName);
-            const motherMatch = nameMatches(searchName, record.mothersName);
+            let bestOverallMatch = null;
+            let bestSearchName = null;
             
-            // Get the best match (highest score)
-            const matches = [nameMatch, fatherMatch, motherMatch].filter(m => m.match);
-            if (matches.length === 0) return null;
+            // Check each search name
+            for (const searchName of searchNames) {
+              const nameMatch = nameMatches(searchName, record.name);
+              const fatherMatch = nameMatches(searchName, record.fathersName);
+              const motherMatch = nameMatches(searchName, record.mothersName);
+              
+              // Get the best match for this search name (highest score)
+              const matches = [nameMatch, fatherMatch, motherMatch].filter(m => m.match);
+              if (matches.length > 0) {
+                const bestMatch = matches.reduce((best, current) => 
+                  current.score > best.score ? current : best
+                );
+                
+                // Keep track of the overall best match across all search names
+                if (!bestOverallMatch || bestMatch.score > bestOverallMatch.score) {
+                  bestOverallMatch = bestMatch;
+                  bestSearchName = searchName;
+                }
+              }
+            }
             
-            const bestMatch = matches.reduce((best, current) => 
-              current.score > best.score ? current : best
-            );
+            if (!bestOverallMatch) return null;
+            
+            // Determine which field matched
+            const nameMatch = nameMatches(bestSearchName, record.name);
+            const fatherMatch = nameMatches(bestSearchName, record.fathersName);
+            const motherMatch = nameMatches(bestSearchName, record.mothersName);
             
             return {
               ...record,
-              matchScore: bestMatch.score,
+              matchScore: bestOverallMatch.score,
               matchedField: nameMatch.match ? 'name' : (fatherMatch.match ? 'fathersName' : 'mothersName'),
-              matchedPart: bestMatch.matchedPart
+              matchedPart: bestOverallMatch.matchedPart,
+              matchedSearchName: bestSearchName // Track which search name matched
             };
           }).filter(record => record !== null)
           // Sort by match score (highest first)
           .sort((a, b) => b.matchScore - a.matchScore)
-          // Show matches with score >= 60 (allows main name part matches)
+          // Show matches with score >= 30 (allows main name part matches)
           // This allows "kowsalya" to match "D.KOWSALYA" when main part matches
           .filter(record => {
-            const passes = record.matchScore >= 60;
+            const passes = record.matchScore >= 30;
             if (!passes) {
               console.log(`Filtered out low-score match: ${record.name} (score: ${record.matchScore})`);
             }
@@ -507,7 +601,7 @@ async function startPollingJob(jobId, verificationNumber, providedToken, dates, 
               job.foundDates.push(foundEntry);
             }
             
-            console.log(`Found ${matchingRecords.length} matching record(s) for "${searchName}" on date ${date}`);
+            console.log(`Found ${matchingRecords.length} matching record(s) for "${searchNames.join(', ')}" on date ${date}`);
           }
           
           // Only store matching records when searching (to save memory)
@@ -551,18 +645,65 @@ async function startPollingJob(jobId, verificationNumber, providedToken, dates, 
                 job.allRecords.push(record);
               });
               
-              if (searchName) {
-                const matchingRecords = records.filter(record => 
-                  nameMatches(searchName, record.name) ||
-                  nameMatches(searchName, record.fathersName) ||
-                  nameMatches(searchName, record.mothersName)
-                );
+              if (searchNames && searchNames.length > 0) {
+                const matchingRecords = records.map(record => {
+                  let bestOverallMatch = null;
+                  let bestSearchName = null;
+                  
+                  for (const searchName of searchNames) {
+                    const nameMatch = nameMatches(searchName, record.name);
+                    const fatherMatch = nameMatches(searchName, record.fathersName);
+                    const motherMatch = nameMatches(searchName, record.mothersName);
+                    
+                    const matches = [nameMatch, fatherMatch, motherMatch].filter(m => m.match);
+                    if (matches.length > 0) {
+                      const bestMatch = matches.reduce((best, current) => 
+                        current.score > best.score ? current : best
+                      );
+                      
+                      if (!bestOverallMatch || bestMatch.score > bestOverallMatch.score) {
+                        bestOverallMatch = bestMatch;
+                        bestSearchName = searchName;
+                      }
+                    }
+                  }
+                  
+                  if (!bestOverallMatch) return null;
+                  
+                  const nameMatch = nameMatches(bestSearchName, record.name);
+                  const fatherMatch = nameMatches(bestSearchName, record.fathersName);
+                  const motherMatch = nameMatches(bestSearchName, record.mothersName);
+                  
+                  return {
+                    ...record,
+                    matchScore: bestOverallMatch.score,
+                    matchedField: nameMatch.match ? 'name' : (fatherMatch.match ? 'fathersName' : 'mothersName'),
+                    matchedPart: bestOverallMatch.matchedPart,
+                    matchedSearchName: bestSearchName
+                  };
+                }).filter(record => record !== null)
+                  .sort((a, b) => b.matchScore - a.matchScore)
+                  .filter(record => record.matchScore >= 30);
                 
                 if (matchingRecords.length > 0) {
-                  const foundEntry = { date, records: matchingRecords };
+                  const foundEntry = { 
+                    date, 
+                    records: matchingRecords,
+                    totalRecordsOnDate: records.length
+                  };
                   const existingIndex = job.foundDates.findIndex(f => f.date === date);
                   if (existingIndex >= 0) {
-                    job.foundDates[existingIndex] = foundEntry;
+                    // Merge records if date already exists
+                    const existing = job.foundDates[existingIndex];
+                    const mergedRecords = [...existing.records, ...matchingRecords];
+                    // Remove duplicates based on name and date
+                    const uniqueRecords = mergedRecords.filter((record, index, self) =>
+                      index === self.findIndex(r => r.name === record.name && r.date === record.date)
+                    );
+                    job.foundDates[existingIndex] = {
+                      ...foundEntry,
+                      records: uniqueRecords
+                    };
                   } else {
                     job.foundDates.push(foundEntry);
                   }
@@ -575,6 +716,14 @@ async function startPollingJob(jobId, verificationNumber, providedToken, dates, 
           }
         }
         
+        // Track error date for retry (only if not a CSRF token issue)
+        if (!result.needsReinit && !result.error.includes('419')) {
+          if (!job.errorDates.includes(date)) {
+            job.errorDates.push(date);
+          }
+          errorDatesToRetry.push(date);
+        }
+        
         job.errors.push({
           date,
           error: result.error,
@@ -582,8 +731,134 @@ async function startPollingJob(jobId, verificationNumber, providedToken, dates, 
         });
       }
 
-      // Small delay between requests to avoid overwhelming the API
-      await new Promise(resolve => setTimeout(resolve, 1000));
+      // Small delay between requests to avoid overwhelming the API and reduce rate limiting
+      await new Promise(resolve => setTimeout(resolve, 1500));
+    }
+
+    // After main cycle, retry error dates once
+    if (errorDatesToRetry.length > 0 && activeJobs.has(jobId)) {
+      console.log(`Retrying ${errorDatesToRetry.length} error date(s) for job ${jobId}...`);
+      job.status = 'retrying_errors';
+      job.retryingErrors = true;
+      job.lastUpdate = new Date().toISOString();
+
+      // Wait a bit before retrying
+      await new Promise(resolve => setTimeout(resolve, 2000));
+
+      for (const errorDate of errorDatesToRetry) {
+        if (!activeJobs.has(jobId)) break;
+
+        console.log(`Retrying date ${errorDate}...`);
+        const retryResult = await pollForDate(jobId, finalVerificationNumber, csrfToken, errorDate, gender);
+        job.totalRequests++;
+
+        if (retryResult.success) {
+          // Remove from error dates
+          job.errorDates = job.errorDates.filter(d => d !== errorDate);
+          // Remove from errors array
+          job.errors = job.errors.filter(e => e.date !== errorDate);
+          
+          const records = parseCertificateData(retryResult.data);
+          
+          if (searchNames && searchNames.length > 0) {
+            const matchingRecords = records.map(record => {
+              let bestOverallMatch = null;
+              let bestSearchName = null;
+              
+              for (const searchName of searchNames) {
+                const nameMatch = nameMatches(searchName, record.name);
+                const fatherMatch = nameMatches(searchName, record.fathersName);
+                const motherMatch = nameMatches(searchName, record.mothersName);
+                
+                const matches = [nameMatch, fatherMatch, motherMatch].filter(m => m.match);
+                if (matches.length > 0) {
+                  const bestMatch = matches.reduce((best, current) => 
+                    current.score > best.score ? current : best
+                  );
+                  
+                  if (!bestOverallMatch || bestMatch.score > bestOverallMatch.score) {
+                    bestOverallMatch = bestMatch;
+                    bestSearchName = searchName;
+                  }
+                }
+              }
+              
+              if (!bestOverallMatch) return null;
+              
+              const nameMatch = nameMatches(bestSearchName, record.name);
+              const fatherMatch = nameMatches(bestSearchName, record.fathersName);
+              const motherMatch = nameMatches(bestSearchName, record.mothersName);
+              
+              return {
+                ...record,
+                matchScore: bestOverallMatch.score,
+                matchedField: nameMatch.match ? 'name' : (fatherMatch.match ? 'fathersName' : 'mothersName'),
+                matchedPart: bestOverallMatch.matchedPart,
+                matchedSearchName: bestSearchName
+              };
+            }).filter(record => record !== null)
+              .sort((a, b) => b.matchScore - a.matchScore)
+              .filter(record => record.matchScore >= 30);
+
+            if (matchingRecords.length > 0) {
+              matchingRecords.forEach(record => {
+                record.date = errorDate;
+              });
+              
+              const foundEntry = {
+                date: errorDate,
+                records: matchingRecords,
+                totalRecordsOnDate: records.length
+              };
+              
+              const existingIndex = job.foundDates.findIndex(f => f.date === errorDate);
+              if (existingIndex >= 0) {
+                const existing = job.foundDates[existingIndex];
+                const mergedRecords = [...existing.records, ...matchingRecords];
+                const uniqueRecords = mergedRecords.filter((record, index, self) =>
+                  index === self.findIndex(r => r.name === record.name && r.date === record.date)
+                );
+                job.foundDates[existingIndex] = {
+                  ...foundEntry,
+                  records: uniqueRecords
+                };
+              } else {
+                job.foundDates.push(foundEntry);
+              }
+              
+              console.log(`Successfully retried date ${errorDate} - found ${matchingRecords.length} matching record(s)`);
+            }
+          } else {
+            records.forEach(record => {
+              record.date = errorDate;
+              job.allRecords.push(record);
+            });
+            
+            if (job.allRecords.length > 1000) {
+              job.allRecords = job.allRecords.slice(-1000);
+            }
+          }
+        } else {
+          // Still failed after retry, update error
+          const errorIndex = job.errors.findIndex(e => e.date === errorDate);
+          if (errorIndex >= 0) {
+            job.errors[errorIndex] = {
+              date: errorDate,
+              error: `Retry failed: ${retryResult.error}`,
+              timestamp: new Date().toISOString()
+            };
+          }
+          console.log(`Retry failed for date ${errorDate}: ${retryResult.error}`);
+        }
+
+        // Delay between retry requests
+        await new Promise(resolve => setTimeout(resolve, 1500));
+      }
+
+      job.retryingErrors = false;
+      job.status = 'running';
+      job.lastUpdate = new Date().toISOString();
+      console.log(`Finished retrying error dates for job ${jobId}`);
     }
 
     // Schedule next poll cycle
