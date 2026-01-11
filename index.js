@@ -61,6 +61,52 @@ function parseCertificateData(htmlData) {
   return records;
 }
 
+// Helper function to parse CRSTN website HTML response
+function parseCRSTNCertificateData(htmlData) {
+  const $ = cheerio.load(htmlData);
+  const records = [];
+  
+  // CRSTN website uses a different table structure
+  // Looking for table with class "bordered" or just any table with rows
+  let rows = $('table.bordered tbody tr');
+  
+  if (rows.length === 0) {
+    rows = $('table tbody tr');
+  }
+  
+  rows.each((index, element) => {
+    const $row = $(element);
+    const cells = $row.find('td');
+    
+    // CRSTN table structure: S NO, REG NO, DECEASED NAME, SEX, DATE OF DEATH, FATHER NAME, MOTHER NAME, REGISTRATION DATE
+    if (cells.length >= 8) {
+      const regNo = $row.find('td:nth-child(2)').text().trim();
+      const name = $row.find('td:nth-child(3)').text().trim();
+      const gender = $row.find('td:nth-child(4)').text().trim();
+      const dateOfDeath = $row.find('td:nth-child(5)').text().trim();
+      const fathersName = $row.find('td:nth-child(6)').text().trim();
+      const mothersName = $row.find('td:nth-child(7)').text().trim();
+      const registrationDate = $row.find('td:nth-child(8)').text().trim();
+      
+      // Skip header row
+      if (name && name !== 'DECEASED NAME' && name !== '.......' && name !== '...' && name.length > 0) {
+        records.push({
+          regNo,
+          name,
+          gender,
+          dateOfDeath,
+          fathersName,
+          mothersName,
+          registrationDate
+        });
+      }
+    }
+  });
+  
+  console.log(`Parsed ${records.length} records from CRSTN HTML`);
+  return records;
+}
+
 // Helper function to normalize names for matching (removes dots, spaces, converts to lowercase)
 function normalizeName(name) {
   if (!name) return '';
@@ -240,6 +286,292 @@ async function initializeSession(jobId, verificationNumber) {
   } catch (error) {
     console.error(`Error initializing session for job ${jobId}:`, error.message);
     throw error;
+  }
+}
+
+// Function to generate captcha using the same algorithm as DrawCaptcha() in the website
+function generateCaptcha() {
+  // DrawCaptcha() algorithm from the website:
+  // var a = Math.ceil(Math.random() * 10) + '';
+  // var b = Math.ceil(Math.random() * 10) + '';
+  // var c = Math.ceil(Math.random() * 10) + '';
+  // var d = Math.ceil(Math.random() * 10) + '';
+  // var e = Math.ceil(Math.random() * 10) + '';
+  // var f = Math.ceil(Math.random() * 10) + '';
+  // var g = Math.ceil(Math.random() * 10) + '';
+  // var code = a + '' + b + '' + '' + c + '' + d + '' + e + '' + f + '' + g;
+  
+  // Math.ceil(Math.random() * 10) gives 1-10, but for digits we want 0-9
+  // However, looking at the actual captcha values (like 48114310, 2665347), they're 7 digits
+  // So we'll use Math.floor(Math.random() * 10) to get 0-9, or keep Math.ceil for 1-10
+  // Actually, Math.ceil(Math.random() * 10) can give 10, but that's fine - it's what the site does
+  
+  const a = Math.ceil(Math.random() * 10);
+  const b = Math.ceil(Math.random() * 10);
+  const c = Math.ceil(Math.random() * 10);
+  const d = Math.ceil(Math.random() * 10);
+  const e = Math.ceil(Math.random() * 10);
+  const f = Math.ceil(Math.random() * 10);
+  const g = Math.ceil(Math.random() * 10);
+  
+  // The original code concatenates: a + '' + b + '' + '' + c + '' + d + '' + e + '' + f + '' + g
+  // The extra '' doesn't matter, it's just string concatenation
+  // Result: 7 digits concatenated together
+  const code = String(a) + String(b) + String(c) + String(d) + String(e) + String(f) + String(g);
+  
+  return code;
+}
+
+// Function to initialize CRSTN session and get OTP
+async function initializeCRSTNSession(jobId, mobileNumber) {
+  try {
+    const cookieJar = jobCookieJars.get(jobId);
+    if (!cookieJar) {
+      throw new Error('Cookie jar not found for job');
+    }
+
+    const axiosWithCookies = wrapper(axios.create({ 
+      jar: cookieJar,
+      withCredentials: true 
+    }));
+
+    // Step 1: GET the DCert page to initialize session
+    const getResponse = await axiosWithCookies.get('https://www.crstn.org/birth_death_tn/DCert', {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+      },
+      timeout: 30000
+    });
+
+    // Step 2: Send OTP request
+    const otpResponse = await axiosWithCookies.post(
+      'https://www.crstn.org/birth_death_tn/PubSendOTP.jsp',
+      new URLSearchParams({ mob: mobileNumber }),
+      {
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept': '*/*',
+          'Accept-Language': 'en-US,en;q=0.9',
+          'X-Requested-With': 'XMLHttpRequest',
+          'Referer': 'https://www.crstn.org/birth_death_tn/DCert'
+        },
+        timeout: 30000
+      }
+    );
+
+    // Extract OTP from response HTML
+    // Response format: "Please Enter the <font size='+1' style='color:#0000FF'>11800</font> to proceed..."
+    // Or error: "Invalid Mobile Number"
+    const otpHtml = typeof otpResponse.data === 'string' ? otpResponse.data : String(otpResponse.data);
+    
+    // Log raw response for debugging
+    console.log(`PubSendOTP Response (first 500 chars): ${otpHtml.substring(0, 500)}`);
+    
+    // Check for error messages first
+    const lowerResponse = otpHtml.toLowerCase().trim();
+    if (lowerResponse.includes('invalid mobile number') || 
+        lowerResponse.includes('please check your mobile number') ||
+        lowerResponse.includes('check your mobile number')) {
+      throw new Error(`OTP request failed: Invalid Mobile Number. The mobile number ${mobileNumber} may not be registered or valid. Please use a valid 10-digit mobile number.`);
+    }
+    
+    let otp = null;
+    
+    // Method 1: Use cheerio to find font tag with specific style attribute
+    try {
+      const $ = cheerio.load(otpHtml);
+      // Try exact match: font with style containing color:#0000FF
+      const fontTag = $("font[style*='color:#0000FF']").text().trim() ||
+                     $("font[style*='color: #0000FF']").text().trim() ||
+                     $("font[size='+1'][style*='color']").text().trim();
+      
+      if (fontTag && /^\d{4,6}$/.test(fontTag)) {
+        otp = fontTag;
+        console.log(`OTP extracted via cheerio font tag: ${otp}`);
+      }
+    } catch (e) {
+      console.log('Cheerio parsing failed, trying regex methods');
+    }
+    
+    // Method 2: Regex to find font tag with number (more specific)
+    if (!otp) {
+      // Match: <font size='+1' style='color:#0000FF'>11800</font>
+      const fontRegex = /<font[^>]*size=['"]\+1['"][^>]*style=['"][^'"]*color:\s*#0000FF[^'"]*['"][^>]*>(\d{4,6})<\/font>/i;
+      const match = otpHtml.match(fontRegex);
+      if (match && match[1]) {
+        otp = match[1];
+        console.log(`OTP extracted via regex (specific): ${otp}`);
+      }
+    }
+    
+    // Method 3: More flexible font tag regex
+    if (!otp) {
+      const fontRegex2 = /<font[^>]*>(\d{4,6})<\/font>/i;
+      const match2 = otpHtml.match(fontRegex2);
+      if (match2 && match2[1]) {
+        otp = match2[1];
+        console.log(`OTP extracted via regex (flexible): ${otp}`);
+      }
+    }
+    
+    // Method 4: Find any 4-6 digit number in the response (last resort)
+    if (!otp) {
+      const numberMatch = otpHtml.match(/\b(\d{4,6})\b/);
+      if (numberMatch && numberMatch[1]) {
+        otp = numberMatch[1];
+        console.log(`OTP extracted via regex (number match): ${otp}`);
+      }
+    }
+
+    if (!otp) {
+      // Log the full response for debugging
+      console.error(`Failed to extract OTP. Full response: ${otpHtml}`);
+      throw new Error(`Could not extract OTP from response. Response: ${otpHtml.substring(0, 200)}`);
+    }
+
+    console.log(`OTP successfully extracted: ${otp}`);
+
+    // Step 3: Verify OTP
+    const verifyResponse = await axiosWithCookies.post(
+      'https://www.crstn.org/birth_death_tn/PubChkOTP.jsp',
+      new URLSearchParams({ 
+        mob: mobileNumber,
+        otp: otp
+      }),
+      {
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept': '*/*',
+          'Accept-Language': 'en-US,en;q=0.9',
+          'X-Requested-With': 'XMLHttpRequest',
+          'Referer': 'https://www.crstn.org/birth_death_tn/DCert'
+        },
+        timeout: 30000
+      }
+    );
+
+    // Check OTP verification response
+    // Expected response: "Number Verified"
+    // Error response: "Invalid Mobile" or similar
+    const verifyResult = typeof verifyResponse.data === 'string' ? verifyResponse.data : String(verifyResponse.data);
+    console.log(`PubChkOTP Response: ${verifyResult.trim()}`);
+    
+    const verifyResultLower = verifyResult.toLowerCase().trim();
+    if (verifyResultLower.includes('invalid') || verifyResultLower === 'invalid mobile') {
+      throw new Error(`OTP verification failed: ${verifyResult.trim()}. The OTP ${otp} may be incorrect or expired.`);
+    }
+    
+    if (!verifyResultLower.includes('number verified') && verifyResultLower !== 'number verified') {
+      console.warn(`Unexpected OTP verification response: ${verifyResult.trim()}. Continuing anyway...`);
+    } else {
+      console.log(`OTP verification successful: Number Verified`);
+    }
+
+    // Step 4: Get captcha from the page (need to fetch DCert page again after OTP verification)
+    // Add a small delay to ensure the server has processed the OTP verification
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    
+    const captchaResponse = await axiosWithCookies.get('https://www.crstn.org/birth_death_tn/DCert', {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Referer': 'https://www.crstn.org/birth_death_tn/DCert'
+      },
+      timeout: 30000
+    });
+
+    // Extract captcha - it's generated client-side via JavaScript DrawCaptcha() function
+    // Since we can't execute JavaScript, we need to generate it ourselves using the same algorithm
+    // The DrawCaptcha() function generates: a + b + c + d + e + f + g (7 random digits)
+    // We'll generate our own captcha using the same logic
+    const captchaValue = generateCaptcha();
+    console.log(`Captcha generated: ${captchaValue}`);
+
+    return {
+      otp,
+      captcha: captchaValue,
+      cookies: cookieJar
+    };
+  } catch (error) {
+    console.error(`Error initializing CRSTN session for job ${jobId}:`, error.message);
+    throw error;
+  }
+}
+
+// Function to poll CRSTN website for a specific date
+async function pollCRSTNForDate(jobId, mobileNumber, gender, otp, captcha, dateOfDeath) {
+  try {
+    const cookieJar = jobCookieJars.get(jobId);
+    if (!cookieJar) {
+      return {
+        success: false,
+        error: 'Session not initialized. Cookie jar not found.',
+        date: dateOfDeath
+      };
+    }
+
+    const axiosWithCookies = wrapper(axios.create({ 
+      jar: cookieJar,
+      withCredentials: true 
+    }));
+
+    // Convert date format from YYYY-MM-DD to DD-MM-YYYY
+    const dateParts = dateOfDeath.split('-');
+    const formattedDate = `${dateParts[2]}-${dateParts[1]}-${dateParts[0]}`;
+
+    // Submit form to DCert endpoint
+    const response = await axiosWithCookies.post(
+      'https://www.crstn.org/birth_death_tn/DCert',
+      new URLSearchParams({
+        txt_rchid: '',
+        selectGender: gender, // M for Male, F for Female, G for Transgender
+        sel_dst: '1005', // Coimbatore
+        rd_bd_type: '2', // Home/Others
+        dod: formattedDate, // Date of death in DD-MM-YYYY format
+        txt_mob: mobileNumber,
+        txt_otp: otp,
+        regcaptchNo: captcha,
+        submit: 'View'
+      }),
+      {
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.9',
+          'Referer': 'https://www.crstn.org/birth_death_tn/DCert'
+        },
+        timeout: 30000,
+        validateStatus: function (status) {
+          return status >= 200 && status < 500;
+        }
+      }
+    );
+
+    if (typeof response.data === 'string' && (response.data.includes('<!DOCTYPE') || response.data.includes('<html'))) {
+      return {
+        success: true,
+        data: response.data,
+        date: dateOfDeath
+      };
+    }
+
+    return {
+      success: false,
+      error: 'Invalid response format',
+      date: dateOfDeath
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error: error.message || 'Request failed',
+      date: dateOfDeath
+    };
   }
 }
 
@@ -912,6 +1244,291 @@ app.get('/api/jobs', (req, res) => {
   
   res.json({ jobs });
 });
+
+// API endpoint to start polling for CRSTN website
+app.post('/api/start-polling-crstn', async (req, res) => {
+  try {
+    const { 
+      mobileNumber = '8825733700',
+      gender = 'M', // M for Male, F for Female, G for Transgender
+      dateOfDeath, // Single date to search
+      startDate, // Optional: for date range search
+      endDate, // Optional: for date range search
+      searchNames, // Array of search names
+      intervalMinutes = 60 
+    } = req.body;
+    
+    if (!mobileNumber || mobileNumber.length !== 10) {
+      return res.status(400).json({ 
+        error: 'Mobile number must be 10 digits' 
+      });
+    }
+
+    // Determine dates to search
+    let dates = [];
+    if (dateOfDeath) {
+      dates = [dateOfDeath];
+    } else if (startDate && endDate) {
+      dates = getDatesInRange(startDate, endDate);
+    } else {
+      return res.status(400).json({ 
+        error: 'Either dateOfDeath or both startDate and endDate must be provided' 
+      });
+    }
+
+    // If dateOfDeath is provided, use it; otherwise use startDate/endDate range
+    // This allows searching a single date or a range
+
+    const normalizedSearchNames = searchNames && Array.isArray(searchNames) && searchNames.length > 0
+      ? searchNames.filter(name => name && name.trim() !== '')
+      : [];
+
+    const jobId = `job_crstn_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    
+    // Create a cookie jar for this job
+    const cookieJar = new CookieJar();
+    jobCookieJars.set(jobId, cookieJar);
+    
+    const results = {
+      jobId,
+      searchName: normalizedSearchNames.length > 0 ? normalizedSearchNames[0] : null,
+      searchNames: normalizedSearchNames.length > 0 ? normalizedSearchNames : null,
+      foundDates: [],
+      allRecords: [],
+      status: 'initializing',
+      startTime: new Date().toISOString(),
+      lastUpdate: null,
+      totalRequests: 0,
+      errors: [],
+      errorDates: [],
+      retryingErrors: false,
+      website: 'crstn'
+    };
+
+    activeJobs.set(jobId, results);
+
+    // Start polling in background
+    startCRSTNPollingJob(jobId, mobileNumber, gender, dates, normalizedSearchNames, intervalMinutes);
+
+    res.json({ 
+      jobId, 
+      message: 'CRSTN polling started. Session will be initialized automatically.',
+      totalDates: dates.length
+    });
+  } catch (error) {
+    console.error('Error starting CRSTN polling:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Main polling function for CRSTN website
+async function startCRSTNPollingJob(jobId, mobileNumber, gender, dates, searchNames, intervalMinutes) {
+  const job = activeJobs.get(jobId);
+  if (!job) return;
+
+  const pollInterval = intervalMinutes * 60 * 1000;
+  let otp = null;
+  let captcha = null;
+
+  // Initialize session and get OTP + captcha
+  try {
+    job.status = 'initializing';
+    job.lastUpdate = new Date().toISOString();
+    
+    console.log(`Initializing CRSTN session for job ${jobId}...`);
+    const sessionData = await initializeCRSTNSession(jobId, mobileNumber);
+    otp = sessionData.otp;
+    captcha = sessionData.captcha;
+    
+    console.log(`CRSTN session initialized. OTP: ${otp}, Captcha: ${captcha}`);
+    job.status = 'running';
+  } catch (error) {
+    job.status = 'error';
+    job.errors.push({
+      date: 'initialization',
+      error: `Failed to initialize CRSTN session: ${error.message}`,
+      timestamp: new Date().toISOString()
+    });
+    console.error(`Failed to initialize CRSTN session for job ${jobId}:`, error);
+    return;
+  }
+
+  let lastOTPTime = Date.now();
+  const OTP_VALIDITY_MS = 4 * 60 * 1000; // 4 minutes (slightly less than 5 to be safe)
+
+  async function runPollCycle() {
+    if (!activeJobs.has(jobId)) return;
+
+    job.status = 'running';
+    job.lastUpdate = new Date().toISOString();
+    job.retryingErrors = false;
+
+    // Reinitialize session for each cycle (OTP expires after 5 minutes)
+    try {
+      const sessionData = await initializeCRSTNSession(jobId, mobileNumber);
+      otp = sessionData.otp;
+      captcha = sessionData.captcha;
+      lastOTPTime = Date.now();
+      console.log(`Reinitialized CRSTN session. OTP: ${otp}, Captcha: ${captcha}`);
+    } catch (error) {
+      console.error(`Failed to reinitialize CRSTN session:`, error);
+      job.errors.push({
+        date: 'reinitialization',
+        error: `Failed to reinitialize: ${error.message}`,
+        timestamp: new Date().toISOString()
+      });
+      // If reinitialization fails, skip this cycle
+      if (activeJobs.has(jobId)) {
+        setTimeout(runPollCycle, pollInterval);
+      }
+      return;
+    }
+
+    const errorDatesToRetry = [];
+
+    for (const date of dates) {
+      if (!activeJobs.has(jobId)) break;
+
+      // IMPORTANT: Each "View" requires a NEW OTP - one OTP can only be used once
+      // So we need to get a fresh OTP and captcha for EACH date search
+      try {
+        console.log(`Getting fresh OTP and captcha for date ${date}...`);
+        const sessionData = await initializeCRSTNSession(jobId, mobileNumber);
+        otp = sessionData.otp;
+        captcha = sessionData.captcha; // Generate new captcha for each request
+        lastOTPTime = Date.now();
+        console.log(`Fresh session for date ${date}. OTP: ${otp}, Captcha: ${captcha}`);
+      } catch (error) {
+        console.error(`Failed to get fresh session for date ${date}:`, error);
+        job.errors.push({
+          date,
+          error: `Failed to get fresh OTP: ${error.message}`,
+          timestamp: new Date().toISOString()
+        });
+        continue; // Skip this date if we can't get fresh OTP
+      }
+
+      const result = await pollCRSTNForDate(jobId, mobileNumber, gender, otp, captcha, date);
+      job.totalRequests++;
+
+      if (result.success) {
+        job.errorDates = job.errorDates.filter(d => d !== date);
+        const records = parseCRSTNCertificateData(result.data);
+        
+        if (searchNames && searchNames.length > 0) {
+          const matchingRecords = records.map(record => {
+            let bestOverallMatch = null;
+            let bestSearchName = null;
+            
+            for (const searchName of searchNames) {
+              const nameMatch = nameMatches(searchName, record.name);
+              const fatherMatch = nameMatches(searchName, record.fathersName);
+              const motherMatch = nameMatches(searchName, record.mothersName);
+              
+              const matches = [nameMatch, fatherMatch, motherMatch].filter(m => m.match);
+              if (matches.length > 0) {
+                const bestMatch = matches.reduce((best, current) => 
+                  current.score > best.score ? current : best
+                );
+                
+                if (!bestOverallMatch || bestMatch.score > bestOverallMatch.score) {
+                  bestOverallMatch = bestMatch;
+                  bestSearchName = searchName;
+                }
+              }
+            }
+            
+            if (!bestOverallMatch) return null;
+            
+            const nameMatch = nameMatches(bestSearchName, record.name);
+            const fatherMatch = nameMatches(bestSearchName, record.fathersName);
+            const motherMatch = nameMatches(bestSearchName, record.mothersName);
+            
+            return {
+              ...record,
+              matchScore: bestOverallMatch.score,
+              matchedField: nameMatch.match ? 'name' : (fatherMatch.match ? 'fathersName' : 'mothersName'),
+              matchedPart: bestOverallMatch.matchedPart,
+              matchedSearchName: bestSearchName
+            };
+          }).filter(record => record !== null)
+            .sort((a, b) => b.matchScore - a.matchScore)
+            .filter(record => record.matchScore >= 30);
+
+          if (matchingRecords.length > 0) {
+            matchingRecords.forEach(record => {
+              record.date = date;
+            });
+            
+            const foundEntry = {
+              date,
+              records: matchingRecords,
+              totalRecordsOnDate: records.length
+            };
+            
+            const existingIndex = job.foundDates.findIndex(f => f.date === date);
+            if (existingIndex >= 0) {
+              const existing = job.foundDates[existingIndex];
+              const mergedRecords = [...existing.records, ...matchingRecords];
+              const uniqueRecords = mergedRecords.filter((record, index, self) =>
+                index === self.findIndex(r => r.name === record.name && r.date === record.date)
+              );
+              job.foundDates[existingIndex] = {
+                ...foundEntry,
+                records: uniqueRecords
+              };
+            } else {
+              job.foundDates.push(foundEntry);
+            }
+            
+            console.log(`Found ${matchingRecords.length} matching record(s) for "${searchNames.join(', ')}" on date ${date}`);
+          }
+        } else {
+          // Store records by date for CRSTN to show parsing verification
+          records.forEach(record => {
+            record.date = date;
+            job.allRecords.push(record);
+          });
+          
+          // Also store records grouped by date for easier display
+          if (!job.recordsByDate) {
+            job.recordsByDate = {};
+          }
+          job.recordsByDate[date] = {
+            date,
+            records: records,
+            count: records.length
+          };
+          
+          if (job.allRecords.length > 1000) {
+            job.allRecords = job.allRecords.slice(-1000);
+          }
+        }
+      } else {
+        if (!job.errorDates.includes(date)) {
+          job.errorDates.push(date);
+        }
+        errorDatesToRetry.push(date);
+        
+        job.errors.push({
+          date,
+          error: result.error,
+          timestamp: new Date().toISOString()
+        });
+      }
+
+      await new Promise(resolve => setTimeout(resolve, 2000)); // Delay between requests
+    }
+
+    // Schedule next poll cycle
+    if (activeJobs.has(jobId)) {
+      setTimeout(runPollCycle, pollInterval);
+    }
+  }
+
+  // Start first cycle immediately
+  runPollCycle();
+}
 
 // Health check endpoint
 app.get('/api/health', (req, res) => {
