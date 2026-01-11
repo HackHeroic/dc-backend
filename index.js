@@ -1400,6 +1400,11 @@ async function startCRSTNPollingJob(jobId, mobileNumber, gender, dates, searchNa
         console.log(`Fresh session for date ${date}. OTP: ${otp}, Captcha: ${captcha}`);
       } catch (error) {
         console.error(`Failed to get fresh session for date ${date}:`, error);
+        // Add to error dates for retry
+        if (!job.errorDates.includes(date)) {
+          job.errorDates.push(date);
+        }
+        errorDatesToRetry.push(date);
         job.errors.push({
           date,
           error: `Failed to get fresh OTP: ${error.message}`,
@@ -1518,6 +1523,170 @@ async function startCRSTNPollingJob(jobId, mobileNumber, gender, dates, searchNa
       }
 
       await new Promise(resolve => setTimeout(resolve, 2000)); // Delay between requests
+    }
+
+    // After main cycle, retry error dates once
+    if (errorDatesToRetry.length > 0 && activeJobs.has(jobId)) {
+      console.log(`[CRSTN] Retrying ${errorDatesToRetry.length} error date(s) for job ${jobId}...`);
+      console.log(`[CRSTN] Error dates to retry: ${errorDatesToRetry.join(', ')}`);
+      job.status = 'retrying_errors';
+      job.retryingErrors = true;
+      job.lastUpdate = new Date().toISOString();
+      // Force update the job in activeJobs to ensure frontend sees the change
+      activeJobs.set(jobId, job);
+
+      // Wait a bit before retrying
+      await new Promise(resolve => setTimeout(resolve, 2000));
+
+      for (const errorDate of errorDatesToRetry) {
+        if (!activeJobs.has(jobId)) break;
+
+        console.log(`Retrying CRSTN date ${errorDate}...`);
+        
+        // Get fresh OTP and captcha for retry
+        try {
+          const sessionData = await initializeCRSTNSession(jobId, mobileNumber);
+          otp = sessionData.otp;
+          captcha = sessionData.captcha;
+          console.log(`Fresh session for retry date ${errorDate}. OTP: ${otp}, Captcha: ${captcha}`);
+        } catch (error) {
+          console.error(`Failed to get fresh session for retry date ${errorDate}:`, error);
+          job.errors.push({
+            date: errorDate,
+            error: `Retry failed - could not get fresh OTP: ${error.message}`,
+            timestamp: new Date().toISOString()
+          });
+          continue;
+        }
+
+        const retryResult = await pollCRSTNForDate(jobId, mobileNumber, gender, otp, captcha, errorDate);
+        job.totalRequests++;
+
+        if (retryResult.success) {
+          // Remove from error dates
+          job.errorDates = job.errorDates.filter(d => d !== errorDate);
+          // Remove from errors array
+          job.errors = job.errors.filter(e => e.date !== errorDate);
+          
+          const records = parseCRSTNCertificateData(retryResult.data);
+          
+          if (searchNames && searchNames.length > 0) {
+            const matchingRecords = records.map(record => {
+              let bestOverallMatch = null;
+              let bestSearchName = null;
+              
+              for (const searchName of searchNames) {
+                const nameMatch = nameMatches(searchName, record.name);
+                const fatherMatch = nameMatches(searchName, record.fathersName);
+                const motherMatch = nameMatches(searchName, record.mothersName);
+                
+                const matches = [nameMatch, fatherMatch, motherMatch].filter(m => m.match);
+                if (matches.length > 0) {
+                  const bestMatch = matches.reduce((best, current) => 
+                    current.score > best.score ? current : best
+                  );
+                  
+                  if (!bestOverallMatch || bestMatch.score > bestOverallMatch.score) {
+                    bestOverallMatch = bestMatch;
+                    bestSearchName = searchName;
+                  }
+                }
+              }
+              
+              if (!bestOverallMatch) return null;
+              
+              const nameMatch = nameMatches(bestSearchName, record.name);
+              const fatherMatch = nameMatches(bestSearchName, record.fathersName);
+              const motherMatch = nameMatches(bestSearchName, record.mothersName);
+              
+              return {
+                ...record,
+                matchScore: bestOverallMatch.score,
+                matchedField: nameMatch.match ? 'name' : (fatherMatch.match ? 'fathersName' : 'mothersName'),
+                matchedPart: bestOverallMatch.matchedPart,
+                matchedSearchName: bestSearchName
+              };
+            }).filter(record => record !== null)
+              .sort((a, b) => b.matchScore - a.matchScore)
+              .filter(record => record.matchScore >= 30);
+
+            if (matchingRecords.length > 0) {
+              matchingRecords.forEach(record => {
+                record.date = errorDate;
+              });
+              
+              const foundEntry = {
+                date: errorDate,
+                records: matchingRecords,
+                totalRecordsOnDate: records.length
+              };
+              
+              const existingIndex = job.foundDates.findIndex(f => f.date === errorDate);
+              if (existingIndex >= 0) {
+                const existing = job.foundDates[existingIndex];
+                const mergedRecords = [...existing.records, ...matchingRecords];
+                const uniqueRecords = mergedRecords.filter((record, index, self) =>
+                  index === self.findIndex(r => r.name === record.name && r.date === record.date)
+                );
+                job.foundDates[existingIndex] = {
+                  ...foundEntry,
+                  records: uniqueRecords
+                };
+              } else {
+                job.foundDates.push(foundEntry);
+              }
+              
+              console.log(`Successfully retried CRSTN date ${errorDate} - found ${matchingRecords.length} matching record(s)`);
+            }
+          } else {
+            records.forEach(record => {
+              record.date = errorDate;
+              job.allRecords.push(record);
+            });
+            
+            // Update recordsByDate
+            if (!job.recordsByDate) {
+              job.recordsByDate = {};
+            }
+            job.recordsByDate[errorDate] = {
+              date: errorDate,
+              records: records,
+              count: records.length
+            };
+            
+            if (job.allRecords.length > 1000) {
+              job.allRecords = job.allRecords.slice(-1000);
+            }
+            
+            console.log(`Successfully retried CRSTN date ${errorDate} - found ${records.length} records`);
+          }
+        } else {
+          // Still failed after retry, update error
+          const errorIndex = job.errors.findIndex(e => e.date === errorDate);
+          if (errorIndex >= 0) {
+            job.errors[errorIndex] = {
+              date: errorDate,
+              error: `Retry failed: ${retryResult.error}`,
+              timestamp: new Date().toISOString()
+            };
+          }
+          console.log(`Retry failed for CRSTN date ${errorDate}: ${retryResult.error}`);
+        }
+
+        // Delay between retry requests
+        await new Promise(resolve => setTimeout(resolve, 2000));
+      }
+
+      job.retryingErrors = false;
+      job.status = 'running';
+      job.lastUpdate = new Date().toISOString();
+      // Force update the job in activeJobs
+      activeJobs.set(jobId, job);
+      console.log(`[CRSTN] Finished retrying error dates for job ${jobId}`);
+    } else {
+      // No errors to retry, make sure retryingErrors is false
+      job.retryingErrors = false;
+      activeJobs.set(jobId, job);
     }
 
     // Schedule next poll cycle
